@@ -1,0 +1,88 @@
+name: Build a52sxq kernel (KSU)
+
+on:
+  workflow_dispatch:
+
+env:
+  KERNEL_REPO: https://github.com/LineageOS/android_kernel_samsung_sm7325
+  KERNEL_BRANCH: lineage-24.0
+  KERNEL_COMMIT: 7a71935c393b          # same commit as the running ROM (g7a71935c393b)
+  EXPECTED_RELEASE: 5.4.302-qgki-g7a71935c393b
+  DEFCONFIG: vendor/lineage-a52sxq_defconfig
+  # AOSP clang used by the ROM (r596125). Verify this URL if the download fails.
+  CLANG_URL: https://android.googlesource.com/platform/prebuilts/clang/host/linux-x86/+archive/refs/heads/main/clang-r596125.tar.gz
+  # KernelSU fork with non-GKI (5.4) support. Check its README for the current setup line.
+  KSU_SETUP: https://raw.githubusercontent.com/rsuntk/KernelSU/main/kernel/setup.sh
+  KSU_REF: main
+
+jobs:
+  build:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y bc bison flex libssl-dev libelf-dev cpio zip lz4 python3 git \
+            gcc-aarch64-linux-gnu gcc-arm-linux-gnueabi
+
+      - name: Download clang
+        run: |
+          mkdir -p $HOME/clang
+          curl -fL "$CLANG_URL" | tar -xz -C $HOME/clang
+          $HOME/clang/bin/clang --version
+
+      - name: Get kernel source
+        run: |
+          git clone --filter=blob:none --no-checkout --branch $KERNEL_BRANCH $KERNEL_REPO $HOME/kernel
+          cd $HOME/kernel
+          git checkout $KERNEL_COMMIT
+          # keep the release string identical to the ROM's so vendor modules still load
+          echo -n "-g${KERNEL_COMMIT}" > .scmversion
+
+      - name: Add KernelSU
+        run: |
+          cd $HOME/kernel
+          curl -LSs "$KSU_SETUP" | bash -s $KSU_REF
+
+      - name: Configure
+        run: |
+          cd $HOME/kernel
+          export PATH=$HOME/clang/bin:$PATH
+          MAKE="make O=out ARCH=arm64 LLVM=1 LLVM_IAS=1 CROSS_COMPILE=aarch64-linux-gnu- CROSS_COMPILE_COMPAT=arm-linux-gnueabi-"
+          echo "MAKE=$MAKE" >> $GITHUB_ENV
+          $MAKE $DEFCONFIG
+          scripts/config --file out/.config -e KSU
+          $MAKE olddefconfig
+          # compare with the config pulled from the phone (config.txt in this repo)
+          if [ -f $GITHUB_WORKSPACE/config.txt ]; then
+            diff <(grep -v '^#' $GITHUB_WORKSPACE/config.txt | sort) \
+                 <(grep -v '^#' out/.config | sort) > $GITHUB_WORKSPACE/config.diff || true
+          fi
+          REL=$($MAKE -s kernelrelease)
+          echo "kernelrelease = $REL"
+          test "$REL" = "$EXPECTED_RELEASE"
+
+      - name: Build
+        run: |
+          cd $HOME/kernel
+          export PATH=$HOME/clang/bin:$PATH
+          $MAKE -j$(nproc) Image
+          ls -la out/arch/arm64/boot/Image
+
+      - name: Package (AnyKernel3)
+        run: |
+          git clone --depth=1 https://github.com/osm0sis/AnyKernel3 $HOME/ak3
+          cd $HOME/ak3
+          rm -rf .git* README.md modules patch ramdisk
+          cp $GITHUB_WORKSPACE/anykernel.sh .
+          cp $HOME/kernel/out/arch/arm64/boot/Image .
+          zip -r9 $GITHUB_WORKSPACE/a52sxq-KSU-${KERNEL_COMMIT}.zip . -x '*.git*'
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: a52sxq-kernel
+          path: |
+            a52sxq-KSU-*.zip
+            config.diff
