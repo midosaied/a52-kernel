@@ -1,109 +1,279 @@
-name: Build a52sxq kernel (KSU)
+
+name: Build a52sxq Kernel - Infinity X + KernelSU
 
 on:
   workflow_dispatch:
+    inputs:
+      ksu_ref:
+        description: "KernelSU branch or tag"
+        required: true
+        default: "main"
+      build_config:
+        description: "Use config.txt from repository when available"
+        required: true
+        type: boolean
+        default: true
 
-env:
-  KERNEL_REPO: https://github.com/LineageOS/android_kernel_samsung_sm7325
-  KERNEL_BRANCH: lineage-24.0
-  KERNEL_COMMIT: 7a71935c393b          # same commit as the running ROM (g7a71935c393b)
-  EXPECTED_RELEASE: 5.4.302-qgki-g7a71935c393b
-  DEFCONFIG: vendor/lineage-a52sxq_defconfig
-  # AOSP clang used by the ROM (r596125). Verify this URL if the download fails.
-  CLANG_URL: https://android.googlesource.com/platform/prebuilts/clang/host/linux-x86/+archive/refs/heads/main/clang-r596125.tar.gz
-  # KernelSU fork with non-GKI (5.4) support. Check its README for the current setup line.
-  KSU_SETUP: https://raw.githubusercontent.com/rsuntk/KernelSU/main/kernel/setup.sh
-  KSU_REF: main
+permissions:
+  contents: read
+
+concurrency:
+  group: a52sxq-kernel-build
+  cancel-in-progress: false
 
 jobs:
   build:
+    name: Build Android 17 kernel for a52sxq
     runs-on: ubuntu-24.04
-    steps:
-      - uses: actions/checkout@v4
+    timeout-minutes: 180
 
-      - name: Install dependencies
+    env:
+      KERNEL_REPO: https://github.com/LineageOS/android_kernel_samsung_sm7325
+      KERNEL_BRANCH: lineage-24.0
+      KERNEL_COMMIT: 7a71935c393b
+      EXPECTED_RELEASE: 5.4.302-qgki-g7a71935c393b
+      DEFCONFIG: vendor/lineage-a52sxq_defconfig
+      KSU_REF: ${{ inputs.ksu_ref }}
+
+    steps:
+      - name: Checkout workflow repository
+        uses: actions/checkout@v4
+
+      - name: Install build dependencies
         run: |
           sudo apt-get update
-          sudo apt-get install -y bc bison flex libssl-dev libelf-dev cpio zip lz4 python3 git \
-            gcc-aarch64-linux-gnu gcc-arm-linux-gnueabi
+          sudo apt-get install -y \
+            bc bison build-essential ccache curl flex \
+            gcc-aarch64-linux-gnu gcc-arm-linux-gnueabi \
+            git lld make pahole python3 python-is-python3 \
+            unzip zip zstd libssl-dev libelf-dev \
+            device-tree-compiler
 
-      - name: Download clang
-        timeout-minutes: 25
+      - name: Download Clang r596125
+        shell: bash
         run: |
-          BASE=https://android.googlesource.com/platform/prebuilts/clang/host/linux-x86
-          mkdir -p $HOME/clang && cd $HOME
-          ok=0
-          # 1) archive download (fast), trying the branches where r596125 lives
-          for ref in main-kernel main master; do
-            echo "trying archive from $ref"
-            if curl -fL --retry 3 --retry-delay 15 "$BASE/+archive/refs/heads/$ref/clang-r596125.tar.gz" -o clang.tgz \
-               && tar -tzf clang.tgz >/dev/null 2>&1; then
-              tar -xzf clang.tgz -C $HOME/clang; ok=1; break
+          set -euo pipefail
+
+          mkdir -p "$RUNNER_TEMP/clang"
+          cd "$RUNNER_TEMP"
+
+          downloaded=0
+
+          for branch in main-kernel main master; do
+            url="https://android.googlesource.com/platform/prebuilts/clang/host/linux-x86/+archive/refs/heads/${branch}/clang-r596125.tar.gz"
+
+            echo "Trying Clang archive: $branch"
+
+            if curl -fL --retry 2 "$url" -o clang.tar.gz; then
+              if tar -xzf clang.tar.gz -C "$RUNNER_TEMP/clang"; then
+                downloaded=1
+                break
+              fi
             fi
           done
-          # 2) fallback: sparse partial clone with retries
-          if [ $ok -eq 0 ]; then
-            echo "archive failed, falling back to sparse git clone"
-            git clone --filter=blob:none --no-checkout --depth=1 --branch main-kernel $BASE prebuilts
-            cd prebuilts
-            git sparse-checkout init --cone
-            git sparse-checkout set clang-r596125
-            for i in 1 2 3 4 5; do git checkout main-kernel && break || sleep 30; done
-            rm -rf $HOME/clang && ln -s $HOME/prebuilts/clang-r596125 $HOME/clang
+
+          if [ "$downloaded" -ne 1 ]; then
+            echo "::error::Could not download Clang r596125."
+            echo "Verify the actual toolchain URL and branch."
+            exit 1
           fi
-          $HOME/clang/bin/clang --version
 
-      - name: Get kernel source
-        run: |
-          git clone --filter=blob:none --no-checkout --branch $KERNEL_BRANCH $KERNEL_REPO $HOME/kernel
-          cd $HOME/kernel
-          git checkout $KERNEL_COMMIT
-          # keep the release string identical to the ROM's so vendor modules still load
-          echo -n "-g${KERNEL_COMMIT}" > .scmversion
+          test -x "$RUNNER_TEMP/clang/bin/clang"
+          "$RUNNER_TEMP/clang/bin/clang" --version
 
-      - name: Add KernelSU
-        run: |
-          cd $HOME/kernel
-          curl -LSs "$KSU_SETUP" | bash -s $KSU_REF
+          echo "$RUNNER_TEMP/clang/bin" >> "$GITHUB_PATH"
 
-      - name: Configure
+      - name: Clone and verify kernel source
+        shell: bash
         run: |
-          cd $HOME/kernel
-          export PATH=$HOME/clang/bin:$PATH
-          MAKE="make O=out ARCH=arm64 LLVM=1 LLVM_IAS=1 CROSS_COMPILE=aarch64-linux-gnu- CROSS_COMPILE_COMPAT=arm-linux-gnueabi-"
-          echo "MAKE=$MAKE" >> $GITHUB_ENV
-          $MAKE $DEFCONFIG
+          set -euo pipefail
+
+          git clone \
+            --filter=blob:none \
+            --no-checkout \
+            --branch "$KERNEL_BRANCH" \
+            "$KERNEL_REPO" kernel
+
+          cd kernel
+
+          git fetch --depth=1 origin "$KERNEL_COMMIT"
+          git checkout --detach FETCH_HEAD
+
+          actual="$(git rev-parse HEAD)"
+          echo "Kernel commit: $actual"
+
+          if [[ "$actual" != "$KERNEL_COMMIT"* ]]; then
+            echo "::error::Kernel commit does not match requested hash."
+            exit 1
+          fi
+
+          echo "Kernel source commit verified."
+
+          if [ ! -f "arch/arm64/configs/$DEFCONFIG" ]; then
+            echo "::error::Defconfig not found: arch/arm64/configs/$DEFCONFIG"
+            echo "Check the actual defconfig name in the kernel source."
+            exit 1
+          fi
+
+      - name: Integrate KernelSU
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd kernel
+
+          setup="$RUNNER_TEMP/kernelsu-setup.sh"
+
+          curl -fL --retry 3 \
+            https://raw.githubusercontent.com/rsuntk/KernelSU/main/kernel/setup.sh \
+            -o "$setup"
+
+          bash -s "$KSU_REF" < "$setup"
+
+          if [ ! -d KernelSU ] && [ ! -d drivers/kernelsu ]; then
+            echo "::error::KernelSU source directory was not found after setup."
+            exit 1
+          fi
+
+          echo "KernelSU integration directory found."
+
+      - name: Configure kernel
+        shell: bash
+        env:
+          USE_UPLOADED_CONFIG: ${{ inputs.build_config }}
+        run: |
+          set -euo pipefail
+          cd kernel
+
+          mkdir -p out
+
+          if [ "$USE_UPLOADED_CONFIG" = "true" ] &&
+             [ -f "$GITHUB_WORKSPACE/config.txt" ]; then
+            echo "Using config.txt as the initial kernel config."
+            cp "$GITHUB_WORKSPACE/config.txt" out/.config
+            make O=out ARCH=arm64 olddefconfig
+          else
+            echo "Using the source tree defconfig."
+            make O=out ARCH=arm64 "$DEFCONFIG"
+          fi
+
+          # KernelSU must be present in Kconfig before enabling it.
+          if ! grep -RqsE \
+            '^[[:space:]]*config KSU([[:space:]]|$)' \
+            drivers KernelSU 2>/dev/null; then
+            echo "::error::Could not find the KernelSU Kconfig entry."
+            exit 1
+          fi
+
           scripts/config --file out/.config -e KSU
-          $MAKE olddefconfig
-          # compare with the config pulled from the phone (config.txt in this repo)
-          if [ -f $GITHUB_WORKSPACE/config.txt ]; then
-            diff <(grep -v '^#' $GITHUB_WORKSPACE/config.txt | sort) \
-                 <(grep -v '^#' out/.config | sort) > $GITHUB_WORKSPACE/config.diff || true
+
+          # Prevent an unwanted -dirty suffix after KernelSU changes.
+          scripts/config --file out/.config -d LOCALVERSION_AUTO
+
+          make O=out ARCH=arm64 olddefconfig
+
+          grep -E \
+            '^(CONFIG_KSU=|CONFIG_LOCALVERSION=|CONFIG_LOCALVERSION_AUTO=|CONFIG_CFI_CLANG=|CONFIG_LTO_CLANG=)' \
+            out/.config || true
+
+          if ! grep -q '^CONFIG_KSU=y$' out/.config; then
+            echo "::error::CONFIG_KSU=y was not enabled."
+            exit 1
           fi
-          REL=$($MAKE -s kernelrelease)
-          echo "kernelrelease = $REL"
-          test "$REL" = "$EXPECTED_RELEASE"
 
-      - name: Build
+          release="$(make -s O=out ARCH=arm64 \
+            LOCALVERSION=-g7a71935c393b kernelrelease)"
+
+          echo "Kernel release: $release"
+
+          if [ "$release" != "$EXPECTED_RELEASE" ]; then
+            echo "::error::Kernel release mismatch."
+            echo "Expected: $EXPECTED_RELEASE"
+            echo "Actual:   $release"
+            exit 1
+          fi
+
+      - name: Build kernel Image
+        shell: bash
         run: |
-          cd $HOME/kernel
-          export PATH=$HOME/clang/bin:$PATH
-          $MAKE -j$(nproc) Image
-          ls -la out/arch/arm64/boot/Image
+          set -euo pipefail
+          cd kernel
 
-      - name: Package (AnyKernel3)
+          make -j"$(nproc)" \
+            O=out \
+            ARCH=arm64 \
+            CC=clang \
+            LLVM=1 \
+            LLVM_IAS=1 \
+            CROSS_COMPILE=aarch64-linux-gnu- \
+            CROSS_COMPILE_ARM32=arm-linux-gnueabi- \
+            LOCALVERSION=-g7a71935c393b \
+            Image
+
+          test -s out/arch/arm64/boot/Image
+
+          file out/arch/arm64/boot/Image
+          sha256sum out/arch/arm64/boot/Image
+
+      - name: Validate AnyKernel3 installer
+        shell: bash
         run: |
-          git clone --depth=1 https://github.com/osm0sis/AnyKernel3 $HOME/ak3
-          cd $HOME/ak3
-          rm -rf .git* README.md modules patch ramdisk
-          cp $GITHUB_WORKSPACE/anykernel.sh .
-          cp $HOME/kernel/out/arch/arm64/boot/Image .
-          zip -r9 $GITHUB_WORKSPACE/a52sxq-KSU-${KERNEL_COMMIT}.zip . -x '*.git*'
+          set -euo pipefail
 
-      - uses: actions/upload-artifact@v4
+          if [ ! -f "$GITHUB_WORKSPACE/anykernel.sh" ]; then
+            echo "::error::Put your anykernel.sh in the repository root."
+            exit 1
+          fi
+
+          grep -q 'device.name1=a52sxq' \
+            "$GITHUB_WORKSPACE/anykernel.sh"
+
+          grep -q 'BLOCK=boot' \
+            "$GITHUB_WORKSPACE/anykernel.sh"
+
+          grep -q 'split_boot;' \
+            "$GITHUB_WORKSPACE/anykernel.sh"
+
+          grep -q 'flash_boot;' \
+            "$GITHUB_WORKSPACE/anykernel.sh"
+
+          if grep -qE 'BLOCK=.*vendor_boot|BLOCK=.*recovery' \
+             "$GITHUB_WORKSPACE/anykernel.sh"; then
+            echo "::error::Installer targets a prohibited partition."
+            exit 1
+          fi
+
+      - name: Package AnyKernel3 ZIP
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          git clone --depth=1 \
+            https://github.com/osm0sis/AnyKernel3.git AnyKernel3
+
+          cd AnyKernel3
+
+          rm -rf .git .github
+          rm -f README.md
+
+          cp "$GITHUB_WORKSPACE/anykernel.sh" anykernel.sh
+          cp "$GITHUB_WORKSPACE/kernel/out/arch/arm64/boot/Image" Image
+
+          test -s Image
+          test -s tools/ak3-core.sh
+
+          zip -r9 "$GITHUB_WORKSPACE/AnyKernel3-a52sxq-KernelSU.zip" .
+
+          unzip -t "$GITHUB_WORKSPACE/AnyKernel3-a52sxq-KernelSU.zip"
+
+          sha256sum "$GITHUB_WORKSPACE/AnyKernel3-a52sxq-KernelSU.zip"
+
+      - name: Upload kernel and ZIP
+        uses: actions/upload-artifact@v4
         with:
-          name: a52sxq-kernel
+          name: a52sxq-infinityx-kernel-${{ github.run_number }}
+          if-no-files-found: error
+          retention-days: 14
           path: |
-            a52sxq-KSU-*.zip
-            config.diff
-          
+            kernel/out/arch/arm64/boot/Image
+            kernel/out/.config
+            AnyKernel3-a52sxq-KernelSU.zip
