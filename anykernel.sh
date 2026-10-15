@@ -1,18 +1,23 @@
-### AnyKernel3 - a52sxq (Galaxy A52s 5G), kernel only. Does NOT touch vendor_boot.
+
+### AnyKernel3 - Samsung Galaxy A52s 5G (a52sxq)
+
 properties() { '
-kernel.string=a52sxq KSU kernel
+kernel.string=a52sxq Infinity X Kernel with KernelSU
 do.devicecheck=1
 do.modules=0
 do.systemless=0
 do.cleanup=1
 do.cleanuponabort=0
 device.name1=a52sxq
+device.name2=SM-A528B
 supported.versions=
 supported.patchlevels=
 supported.vendorpatchlevels=
 '; }
 
-BLOCK=/dev/block/bootdevice/by-name/boot;
+# Target the boot partition only.
+# vendor_boot and recovery are separate partitions.
+BLOCK=boot;
 IS_SLOT_DEVICE=0;
 RAMDISK_COMPRESSION=auto;
 PATCH_VBMETA_FLAG=auto;
