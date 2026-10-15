@@ -29,8 +29,19 @@ jobs:
 
       - name: Download clang
         run: |
-          mkdir -p $HOME/clang
-          curl -fL "$CLANG_URL" | tar -xz -C $HOME/clang
+          git clone --filter=blob:none --no-checkout \
+            https://android.googlesource.com/platform/prebuilts/clang/host/linux-x86 $HOME/prebuilts
+          cd $HOME/prebuilts
+          FOUND=""
+          for br in origin/main $(git for-each-ref --format='%(refname:short)' refs/remotes/origin); do
+            if git ls-tree --name-only $br 2>/dev/null | grep -qx clang-r596125; then
+              FOUND=$br; break
+            fi
+          done
+          echo "clang-r596125 found in: $FOUND"
+          test -n "$FOUND"
+          git checkout $FOUND -- clang-r596125
+          ln -s $HOME/prebuilts/clang-r596125 $HOME/clang
           $HOME/clang/bin/clang --version
 
       - name: Get kernel source
