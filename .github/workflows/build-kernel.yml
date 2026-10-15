@@ -171,14 +171,29 @@ jobs:
           scripts/config --file out/.config -e KSU
           scripts/config --file out/.config -d LOCALVERSION_AUTO
 
+          # KPROBES hook mode instead of manual hooks
+          scripts/config --file out/.config -d KSU_MANUAL_HOOK
+          scripts/config --file out/.config -e KPROBES
+          scripts/config --file out/.config -e KPROBE_EVENTS
+
           make O=out ARCH=arm64 LLVM=1 olddefconfig
 
           grep -E \
-            '^(CONFIG_KSU=|CONFIG_LOCALVERSION=|CONFIG_LOCALVERSION_AUTO=|CONFIG_CFI_CLANG=|CONFIG_LTO_CLANG=)' \
+            '^(CONFIG_KSU|CONFIG_KPROBES|CONFIG_KPROBE_EVENTS|CONFIG_LOCALVERSION=|CONFIG_CFI_CLANG=|CONFIG_LTO_CLANG=)' \
             out/.config || true
 
           if ! grep -q '^CONFIG_KSU=y$' out/.config; then
             echo "::error::CONFIG_KSU=y was not enabled."
+            exit 1
+          fi
+
+          if grep -q '^CONFIG_KSU_MANUAL_HOOK=y$' out/.config; then
+            echo "::error::KSU_MANUAL_HOOK is still enabled."
+            exit 1
+          fi
+
+          if ! grep -q '^CONFIG_KPROBES=y$' out/.config; then
+            echo "::error::CONFIG_KPROBES=y was not enabled."
             exit 1
           fi
 
