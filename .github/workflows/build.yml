@@ -28,20 +28,29 @@ jobs:
             gcc-aarch64-linux-gnu gcc-arm-linux-gnueabi
 
       - name: Download clang
+        timeout-minutes: 25
         run: |
-          git clone --filter=blob:none --no-checkout \
-            https://android.googlesource.com/platform/prebuilts/clang/host/linux-x86 $HOME/prebuilts
-          cd $HOME/prebuilts
-          FOUND=""
-          for br in origin/main $(git for-each-ref --format='%(refname:short)' refs/remotes/origin); do
-            if git ls-tree --name-only $br 2>/dev/null | grep -qx clang-r596125; then
-              FOUND=$br; break
+          BASE=https://android.googlesource.com/platform/prebuilts/clang/host/linux-x86
+          mkdir -p $HOME/clang && cd $HOME
+          ok=0
+          # 1) archive download (fast), trying the branches where r596125 lives
+          for ref in main-kernel main master; do
+            echo "trying archive from $ref"
+            if curl -fL --retry 3 --retry-delay 15 "$BASE/+archive/refs/heads/$ref/clang-r596125.tar.gz" -o clang.tgz \
+               && tar -tzf clang.tgz >/dev/null 2>&1; then
+              tar -xzf clang.tgz -C $HOME/clang; ok=1; break
             fi
           done
-          echo "clang-r596125 found in: $FOUND"
-          test -n "$FOUND"
-          git checkout $FOUND -- clang-r596125
-          ln -s $HOME/prebuilts/clang-r596125 $HOME/clang
+          # 2) fallback: sparse partial clone with retries
+          if [ $ok -eq 0 ]; then
+            echo "archive failed, falling back to sparse git clone"
+            git clone --filter=blob:none --no-checkout --depth=1 --branch main-kernel $BASE prebuilts
+            cd prebuilts
+            git sparse-checkout init --cone
+            git sparse-checkout set clang-r596125
+            for i in 1 2 3 4 5; do git checkout main-kernel && break || sleep 30; done
+            rm -rf $HOME/clang && ln -s $HOME/prebuilts/clang-r596125 $HOME/clang
+          fi
           $HOME/clang/bin/clang --version
 
       - name: Get kernel source
@@ -97,3 +106,4 @@ jobs:
           path: |
             a52sxq-KSU-*.zip
             config.diff
+          
