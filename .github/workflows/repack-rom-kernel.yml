@@ -51,7 +51,8 @@ jobs:
           unzip -o -q magisk.apk 'lib/x86_64/libmagiskboot.so' -d mb
           cp mb/lib/x86_64/libmagiskboot.so magiskboot
           chmod +x magiskboot
-          ./magiskboot 2>&1 | head -2
+          ./magiskboot 2>&1 | head -2 || true
+          test -x ./magiskboot
           echo "MAGISKBOOT=$RUNNER_TEMP/tools/magiskboot" >> "$GITHUB_ENV"
 
       - name: Get avbtool (optional)
