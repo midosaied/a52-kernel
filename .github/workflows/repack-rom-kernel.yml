@@ -1,0 +1,263 @@
+name: Repack bone-machine kernel into ROM images (a52sxq)
+
+on:
+  workflow_dispatch:
+    inputs:
+      bm_zip_id:
+        description: "Google Drive file ID of the bone-machine AOSP ZIP"
+        required: true
+        default: "1NTOzA1VT3o5ZJtARz8DWy05SvvTXZeAB"
+      boot_id:
+        description: "Drive file ID of ROM boot.img"
+        required: true
+        default: "1Q8q51K8Ytx_aKMQSR34dKxMxH_lUtbM2"
+      vendor_boot_id:
+        description: "Drive file ID of ROM vendor_boot.img"
+        required: true
+        default: "1q5kWO4FRAu_dp0RdFfvp8yastm84byrr"
+      dtbo_id:
+        description: "Drive file ID of ROM dtbo.img"
+        required: true
+        default: "18_sRfxX8QJlYQsC696XVqzMPDjYZ8z0y"
+      keep_rom_dtbo:
+        description: "Keep the ROM dtbo instead of the bone-machine one"
+        required: true
+        type: boolean
+        default: false
+
+permissions:
+  contents: read
+
+jobs:
+  repack:
+    name: Repack boot and vendor_boot
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+
+    steps:
+      - name: Install tools
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y zip unzip binutils python3-pip
+          python3 -m pip install --break-system-packages gdown
+
+      - name: Get magiskboot (Magisk v30.7)
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p "$RUNNER_TEMP/tools" && cd "$RUNNER_TEMP/tools"
+          curl -fL --retry 3 -o magisk.apk \
+            https://github.com/topjohnwu/Magisk/releases/download/v30.7/Magisk-v30.7.apk
+          unzip -o -q magisk.apk 'lib/x86_64/libmagiskboot.so' -d mb
+          cp mb/lib/x86_64/libmagiskboot.so magiskboot
+          chmod +x magiskboot
+          ./magiskboot 2>&1 | head -2
+          echo "MAGISKBOOT=$RUNNER_TEMP/tools/magiskboot" >> "$GITHUB_ENV"
+
+      - name: Get avbtool (optional)
+        shell: bash
+        run: |
+          cd "$RUNNER_TEMP/tools"
+          if curl -fL --retry 3 \
+              "https://android.googlesource.com/platform/external/avb/+/refs/heads/main/avbtool.py?format=TEXT" \
+              -o avbtool.b64 && base64 -d avbtool.b64 > avbtool.py && python3 avbtool.py --help >/dev/null 2>&1; then
+            echo "AVBTOOL=$RUNNER_TEMP/tools/avbtool.py" >> "$GITHUB_ENV"
+            echo "avbtool ready"
+          else
+            echo "::warning::avbtool not available, AVB footers will not be erased"
+          fi
+
+      - name: Download inputs from Google Drive
+        shell: bash
+        env:
+          BM_ID: ${{ inputs.bm_zip_id }}
+          BOOT_ID: ${{ inputs.boot_id }}
+          VB_ID: ${{ inputs.vendor_boot_id }}
+          DTBO_ID: ${{ inputs.dtbo_id }}
+        run: |
+          set -euo pipefail
+          mkdir -p "$RUNNER_TEMP/in" && cd "$RUNNER_TEMP/in"
+
+          get() {
+            local id="$1" out="$2"
+            if ! [[ "$id" =~ ^[A-Za-z0-9_-]{20,}$ ]]; then
+              echo "::error::Invalid Drive file ID for $out"; exit 1
+            fi
+            gdown "https://drive.google.com/uc?id=$id" -O "$out" || {
+              echo "::error::Could not download $out. Set the file sharing to 'Anyone with the link'."
+              exit 1
+            }
+            [ "$(stat -c %s "$out")" -gt 100000 ] || {
+              echo "::error::$out is too small, probably an error page, not the real file."
+              exit 1
+            }
+          }
+
+          get "$BM_ID"   bonemachine.zip
+          get "$BOOT_ID" rom_boot.img
+          get "$VB_ID"   rom_vendor_boot.img
+          get "$DTBO_ID" rom_dtbo.img
+
+          unzip -tq bonemachine.zip
+          [ "$(head -c 8 rom_boot.img)" = "ANDROID!" ] || { echo "::error::rom_boot.img is not an Android boot image"; exit 1; }
+          [ "$(head -c 8 rom_vendor_boot.img)" = "VNDRBOOT" ] || { echo "::error::rom_vendor_boot.img is not a vendor_boot image"; exit 1; }
+          [ "$(head -c 4 rom_dtbo.img | od -An -tx1 | tr -d ' \n')" = "d7b7ab1e" ] || echo "::warning::rom_dtbo.img has an unexpected header"
+
+          echo "Input checksums (compare with your backups):"
+          sha256sum bonemachine.zip rom_boot.img rom_vendor_boot.img rom_dtbo.img
+
+      - name: Write repack script
+        shell: bash
+        run: |
+          cat > "$RUNNER_TEMP/repack.sh" <<'REPACK_EOF'
+          #!/usr/bin/env bash
+          # Usage: repack.sh <rom_boot.img> <rom_vendor_boot.img> <rom_dtbo.img> <bonemachine.zip> <outdir>
+          set -euo pipefail
+
+          ROM_BOOT="$(readlink -f "$1")"
+          ROM_VB="$(readlink -f "$2")"
+          ROM_DTBO="$(readlink -f "$3")"
+          BM_ZIP="$(readlink -f "$4")"
+          OUT="$(readlink -f "$5")"
+          KEEP_ROM_DTBO="${KEEP_ROM_DTBO:-false}"
+          MB="${MAGISKBOOT:?set MAGISKBOOT}"
+          AVB="${AVBTOOL:-}"
+          MAX=$((96 * 1024 * 1024))
+
+          W="$(mktemp -d)"
+          mkdir -p "$OUT" "$W"/{bm,bm_boot,bm_vb,bm_rd,rom_boot,rom_vb}
+
+          echo "== 1. Unpack bone-machine ZIP"
+          unzip -q -o "$BM_ZIP" -d "$W/bm"
+          for f in boot.img vendor_boot.img dtbo.img; do
+            test -s "$W/bm/images/$f" || { echo "::error::$f missing inside bone-machine ZIP"; exit 1; }
+          done
+          test -d "$W/bm/META-INF" || { echo "::error::META-INF missing in bone-machine ZIP"; exit 1; }
+
+          echo "== 2. Extract kernel + dtb + modules from bone-machine"
+          cp "$W/bm/images/boot.img" "$W/bm_boot/"
+          ( cd "$W/bm_boot" && "$MB" unpack boot.img >/dev/null 2>&1 || true )
+          test -s "$W/bm_boot/kernel"
+          BM_KVER="$(strings -n 8 "$W/bm_boot/kernel" | grep -m1 'Linux version' || true)"
+          echo "bone-machine kernel: $BM_KVER"
+
+          cp "$W/bm/images/vendor_boot.img" "$W/bm_vb/"
+          ( cd "$W/bm_vb" && "$MB" unpack -h vendor_boot.img >/dev/null 2>&1 || true )
+          test -s "$W/bm_vb/dtb"
+          cp "$W/bm_vb/ramdisk.cpio" "$W/bm_rd/"
+          ( cd "$W/bm_rd" && "$MB" cpio ramdisk.cpio extract >/dev/null )
+          test -d "$W/bm_rd/lib/modules"
+          echo "bone-machine modules: $(ls "$W/bm_rd/lib/modules" | grep -c '\.ko$') .ko files"
+
+          strip_footer() {
+            local img="$1"
+            if [ -n "$AVB" ]; then
+              python3 "$AVB" erase_footer --image "$img" 2>/dev/null || echo "(no AVB footer on $(basename "$img"))"
+            fi
+          }
+
+          echo "== 3. ROM boot.img: replace kernel only"
+          cp "$ROM_BOOT" "$W/rom_boot/boot.img"
+          strip_footer "$W/rom_boot/boot.img"
+          ( cd "$W/rom_boot" && "$MB" unpack boot.img >/dev/null 2>&1 || true )
+          test -s "$W/rom_boot/kernel" || { echo "::error::ROM boot.img has no kernel"; exit 1; }
+          ROM_KVER="$(strings -n 8 "$W/rom_boot/kernel" | grep -m1 'Linux version' || true)"
+          echo "ROM kernel (before): ${ROM_KVER:-unknown}"
+          cp "$W/bm_boot/kernel" "$W/rom_boot/kernel"
+          ( cd "$W/rom_boot" && "$MB" repack boot.img "$OUT/boot.img" >/dev/null 2>&1 || true )
+          test -s "$OUT/boot.img" || { echo "::error::boot repack failed"; exit 1; }
+
+          echo "== 4. ROM vendor_boot.img: replace dtb + modules (keep ROM fstab)"
+          cp "$ROM_VB" "$W/rom_vb/vendor_boot.img"
+          strip_footer "$W/rom_vb/vendor_boot.img"
+          ( cd "$W/rom_vb" && "$MB" unpack -h vendor_boot.img >/dev/null 2>&1 || true )
+          test -s "$W/rom_vb/ramdisk.cpio" -a -s "$W/rom_vb/dtb" -a -s "$W/rom_vb/header" || { echo "::error::ROM vendor_boot.img could not be unpacked"; exit 1; }
+          cp "$W/bm_vb/dtb" "$W/rom_vb/dtb"
+
+          CPIO="$W/rom_vb/ramdisk.cpio"
+          test -s "$CPIO"
+          echo "ROM modules (before): $(cd "$W/rom_vb" && "$MB" cpio ramdisk.cpio 'ls -r /lib/modules' 2>/dev/null | grep -c '\.ko$') .ko files"
+          ( cd "$W/rom_vb" && "$MB" cpio ramdisk.cpio 'ls -r /lib/modules' 2>/dev/null | awk -F'\t' '{print $NF}' | sed 's#^lib/modules/##' | grep '\.ko$' | sort > "$W/rom_modules.txt" ) || true
+          ls "$W/bm_rd/lib/modules" | grep '\.ko$' | sort > "$W/bm_modules.txt"
+
+          CMDS=()
+          if ( cd "$W/rom_vb" && "$MB" cpio ramdisk.cpio 'exists lib/modules' >/dev/null 2>&1 ); then
+            CMDS+=("rm -r lib/modules")
+          fi
+          CMDS+=("mkdir 755 lib/modules")
+          for f in "$W/bm_rd/lib/modules/"*; do
+            CMDS+=("add 644 lib/modules/$(basename "$f") $f")
+          done
+          for fw in "$W/bm_rd/lib/firmware/tsp_stm/"*; do
+            [ -f "$fw" ] || continue
+            if ! ( cd "$W/rom_vb" && "$MB" cpio ramdisk.cpio 'exists lib/firmware/tsp_stm' >/dev/null 2>&1 ); then
+              ( cd "$W/rom_vb" && "$MB" cpio ramdisk.cpio 'mkdir 755 lib/firmware/tsp_stm' >/dev/null 2>&1 ) || true
+            fi
+            CMDS+=("add 644 lib/firmware/tsp_stm/$(basename "$fw") $fw")
+          done
+          ( cd "$W/rom_vb" && "$MB" cpio ramdisk.cpio "${CMDS[@]}" >/dev/null )
+
+          # ROM-only modules we are dropping (informational)
+          echo "-- ROM modules not present in bone-machine set:"
+          comm -23 "$W/rom_modules.txt" "$W/bm_modules.txt" || true
+          echo "-- bone-machine modules not present in ROM set:"
+          comm -13 "$W/rom_modules.txt" "$W/bm_modules.txt" || true
+
+          ( cd "$W/rom_vb" && "$MB" repack vendor_boot.img "$OUT/vendor_boot.img" >/dev/null 2>&1 || true )
+          test -s "$OUT/vendor_boot.img" || { echo "::error::vendor_boot repack failed"; exit 1; }
+
+          echo "== 5. dtbo"
+          if [ "$KEEP_ROM_DTBO" = "true" ]; then
+            cp "$ROM_DTBO" "$OUT/dtbo.img"; echo "using ROM dtbo"
+          else
+            cp "$W/bm/images/dtbo.img" "$OUT/dtbo.img"; echo "using bone-machine dtbo"
+          fi
+
+          echo "== 6. Size checks"
+          for f in boot.img vendor_boot.img dtbo.img; do
+            s=$(stat -c %s "$OUT/$f"); echo "$f: $s bytes"
+            [ "$s" -le "$MAX" ] || { echo "::error::$f is larger than the 96 MiB partition"; exit 1; }
+          done
+
+          echo "== 7. Verify result"
+          mkdir -p "$W/v1" "$W/v2"
+          cp "$OUT/boot.img" "$W/v1/"; ( cd "$W/v1" && "$MB" unpack boot.img >/dev/null 2>&1 || true )
+          cmp "$W/v1/kernel" "$W/bm_boot/kernel" && echo "OK: boot.img kernel == bone-machine kernel"
+          cp "$OUT/vendor_boot.img" "$W/v2/"; ( cd "$W/v2" && "$MB" unpack -h vendor_boot.img >/dev/null 2>&1 || true )
+          cmp "$W/v2/dtb" "$W/bm_vb/dtb" && echo "OK: vendor_boot dtb == bone-machine dtb"
+          ( cd "$W/v2" && "$MB" cpio ramdisk.cpio 'exists first_stage_ramdisk/fstab.qcom' ) && echo "OK: ROM fstab.qcom still present"
+          echo "modules in result: $( cd "$W/v2" && "$MB" cpio ramdisk.cpio 'ls -r /lib/modules' 2>/dev/null | grep -c '\.ko$')"
+
+          echo "== 8. Build flashable ZIP"
+          Z="$W/zip"; mkdir -p "$Z/images"
+          cp -r "$W/bm/META-INF" "$Z/"
+          [ -f "$W/bm/banner" ] && cp "$W/bm/banner" "$Z/" || true
+          cp "$OUT/boot.img" "$OUT/vendor_boot.img" "$OUT/dtbo.img" "$Z/images/"
+          ( cd "$Z" && zip -r -9 -q "$OUT/bonemachine-a52sxq-ROMimages.zip" META-INF images $( [ -f banner ] && echo banner ) )
+          unzip -t "$OUT/bonemachine-a52sxq-ROMimages.zip" | tail -1
+          sha256sum "$OUT"/*.zip "$OUT"/*.img
+          REPACK_EOF
+          chmod +x "$RUNNER_TEMP/repack.sh"
+          bash -n "$RUNNER_TEMP/repack.sh"
+
+      - name: Repack
+        shell: bash
+        env:
+          KEEP_ROM_DTBO: ${{ inputs.keep_rom_dtbo }}
+        run: |
+          set -euo pipefail
+          mkdir -p "$GITHUB_WORKSPACE/out"
+          cd "$RUNNER_TEMP/in"
+          "$RUNNER_TEMP/repack.sh" \
+            rom_boot.img rom_vendor_boot.img rom_dtbo.img \
+            bonemachine.zip "$GITHUB_WORKSPACE/out" | tee "$GITHUB_WORKSPACE/out/repack.log"
+
+      - name: Upload result
+        uses: actions/upload-artifact@v4
+        with:
+          name: a52sxq-bonemachine-ROMimages-${{ github.run_number }}
+          if-no-files-found: error
+          retention-days: 14
+          path: |
+            out/bonemachine-a52sxq-ROMimages.zip
+            out/repack.log
