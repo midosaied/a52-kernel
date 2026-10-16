@@ -164,6 +164,12 @@ jobs:
           test -s "$W/rom_boot/kernel" || { echo "::error::ROM boot.img has no kernel"; exit 1; }
           ROM_KVER="$(strings -n 8 "$W/rom_boot/kernel" | grep -m1 'Linux version' || true)"
           echo "ROM kernel (before): ${ROM_KVER:-unknown}"
+          echo "-- ROM boot.img info:"
+          BINFO="$( cd "$W/rom_boot" && "$MB" unpack boot.img 2>&1 || true )"
+          echo "$BINFO" | grep -E 'HEADER_VER|KERNEL_SZ|RAMDISK_SZ|RAMDISK_FMT|OS_VERSION|OS_PATCH' || true
+          if [ -s "$W/rom_boot/ramdisk.cpio" ]; then
+            echo "ROM boot ramdisk: $(cd "$W/rom_boot" && "$MB" cpio ramdisk.cpio 'ls -r /' 2>/dev/null | wc -l) entries, $(cd "$W/rom_boot" && "$MB" cpio ramdisk.cpio 'ls -r /' 2>/dev/null | grep -c '\.ko$') .ko"
+          fi
           cp "$W/bm_boot/kernel" "$W/rom_boot/kernel"
           ( cd "$W/rom_boot" && "$MB" repack boot.img "$OUT/boot.img" >/dev/null 2>&1 || true )
           test -s "$OUT/boot.img" || { echo "::error::boot repack failed"; exit 1; }
@@ -177,6 +183,14 @@ jobs:
 
           CPIO="$W/rom_vb/ramdisk.cpio"
           test -s "$CPIO"
+          echo "-- ROM vendor_boot.img info:"
+          VINFO="$( cd "$W/rom_vb" && "$MB" unpack -h vendor_boot.img 2>&1 || true )"
+          echo "$VINFO" | grep -E 'HEADER_VER|RAMDISK_SZ|DTB_SZ|RAMDISK_FMT|NAME' || true
+          echo "-- ROM vendor_boot ramdisk listing (first 120 entries):"
+          ( cd "$W/rom_vb" && "$MB" cpio ramdisk.cpio 'ls -r /' 2>/dev/null | awk -F'\t' '{print $1" "$5" "$NF}' | head -120 ) || true
+          echo "ROM vendor_boot ramdisk total entries: $(cd "$W/rom_vb" && "$MB" cpio ramdisk.cpio 'ls -r /' 2>/dev/null | wc -l)"
+          echo "ROM vendor_boot first_stage_ramdisk entries:"
+          ( cd "$W/rom_vb" && "$MB" cpio ramdisk.cpio 'ls -r /first_stage_ramdisk' 2>/dev/null | awk -F'\t' '{print $NF}' | head -40 ) || true
           echo "ROM modules (before): $(cd "$W/rom_vb" && "$MB" cpio ramdisk.cpio 'ls -r /lib/modules' 2>/dev/null | grep -c '\.ko$') .ko files"
           ( cd "$W/rom_vb" && "$MB" cpio ramdisk.cpio 'ls -r /lib/modules' 2>/dev/null | awk -F'\t' '{print $NF}' | sed 's#^lib/modules/##' | grep '\.ko$' | sort > "$W/rom_modules.txt" ) || true
           ls "$W/bm_rd/lib/modules" | grep '\.ko$' | sort > "$W/bm_modules.txt"
