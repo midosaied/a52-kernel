@@ -4,9 +4,9 @@ on:
   workflow_dispatch:
     inputs:
       ksu_ref:
-        description: "KernelSU branch or tag"
+        description: "KernelSU-Next legacy tag (v3.2.0-legacy is tested by bone-machine)"
         required: true
-        default: "main"
+        default: "v3.2.0-legacy"
       build_config:
         description: "Use config.txt from repository when available"
         required: true
@@ -120,26 +120,239 @@ jobs:
             exit 1
           fi
 
-      - name: Integrate KernelSU
+      - name: Integrate KernelSU-Next (legacy, manual hooks)
         shell: bash
         run: |
           set -euo pipefail
           cd kernel
 
-          setup="$RUNNER_TEMP/kernelsu-setup.sh"
+          # Full clone on purpose: KernelSU-Next derives its version from git history.
+          git clone --branch "$KSU_REF" \
+            https://github.com/KernelSU-Next/KernelSU-Next.git KernelSU-Next
+          echo "KernelSU-Next commit: $(git -C KernelSU-Next rev-parse --short HEAD)"
+          echo "KernelSU-Next commits: $(git -C KernelSU-Next rev-list --count HEAD)"
 
-          curl -fL --retry 3 \
-            https://raw.githubusercontent.com/rsuntk/KernelSU/main/kernel/setup.sh \
-            -o "$setup"
+          test -f KernelSU-Next/kernel/Kconfig
 
-          bash -s "$KSU_REF" < "$setup"
+          ln -sfn ../KernelSU-Next/kernel drivers/kernelsu
 
-          if [ ! -d KernelSU ] && [ ! -d drivers/kernelsu ]; then
-            echo "::error::KernelSU source directory was not found after setup."
-            exit 1
+          if ! grep -q 'kernelsu' drivers/Makefile; then
+            printf '\n# KernelSU-Next\nobj-$(CONFIG_KSU) += kernelsu/\n' >> drivers/Makefile
           fi
 
-          echo "KernelSU integration directory found."
+          if ! grep -q 'drivers/kernelsu/Kconfig' drivers/Kconfig; then
+            python3 - <<'KCONF_EOF'
+          p = "drivers/Kconfig"
+          s = open(p).read()
+          i = s.rindex("endmenu")
+          s = s[:i] + '\n# KernelSU-Next\nsource "drivers/kernelsu/Kconfig"\n\n' + s[i:]
+          open(p, "w").write(s)
+          KCONF_EOF
+          fi
+
+          cat > "$RUNNER_TEMP/ksu_manual_hooks.py" <<'HOOKS_EOF'
+          #!/usr/bin/env python3
+          """Apply KernelSU-Next manual hooks to a Linux 5.4 kernel tree (arm64).
+          Usage: ksu_manual_hooks.py <kernel_root>
+          Every anchor must match exactly once, otherwise the script fails loudly."""
+          import sys, pathlib
+
+          root = pathlib.Path(sys.argv[1])
+
+          def patch(rel, edits):
+              p = root / rel
+              s = p.read_text()
+              if "ksu_handle" in s or "ksu_vfs_read_hook" in s:
+                  print(f"[skip] {rel}: already patched")
+                  return
+              for old, new in edits:
+                  n = s.count(old)
+                  if n != 1:
+                      sys.exit(f"::error::{rel}: anchor found {n} times (need exactly 1):\n{old}")
+                  s = s.replace(old, new)
+              p.write_text(s)
+              print(f"[ok]   {rel}")
+
+          # ---------------- fs/exec.c ----------------
+          patch("fs/exec.c", [
+          (
+          """int do_execve(struct filename *filename,
+          	const char __user *const __user *__argv,
+          	const char __user *const __user *__envp)
+          {
+          	struct user_arg_ptr argv = { .ptr.native = __argv };
+          	struct user_arg_ptr envp = { .ptr.native = __envp };
+          	return do_execveat_common(AT_FDCWD, filename, argv, envp, 0);
+          }
+          """,
+          """#ifdef CONFIG_KSU
+          extern int ksu_handle_execveat(int *fd, struct filename **filename_ptr, void *argv,
+          			       void *envp, int *flags);
+          #endif
+
+          int do_execve(struct filename *filename,
+          	const char __user *const __user *__argv,
+          	const char __user *const __user *__envp)
+          {
+          	struct user_arg_ptr argv = { .ptr.native = __argv };
+          	struct user_arg_ptr envp = { .ptr.native = __envp };
+          #ifdef CONFIG_KSU
+          	ksu_handle_execveat((int *)AT_FDCWD, &filename, &argv, &envp, 0);
+          #endif
+          	return do_execveat_common(AT_FDCWD, filename, argv, envp, 0);
+          }
+          """),
+          ])
+
+          # ---------------- fs/open.c ----------------
+          patch("fs/open.c", [
+          (
+          """SYSCALL_DEFINE3(faccessat, int, dfd, const char __user *, filename, int, mode)
+          {
+          	return do_faccessat(dfd, filename, mode);
+          }
+          """,
+          """#ifdef CONFIG_KSU
+          extern int ksu_handle_faccessat(int *dfd, const char __user **filename_user,
+          				int *mode, int *flags);
+          #endif
+
+          SYSCALL_DEFINE3(faccessat, int, dfd, const char __user *, filename, int, mode)
+          {
+          #ifdef CONFIG_KSU
+          	ksu_handle_faccessat(&dfd, &filename, &mode, NULL);
+          #endif
+          	return do_faccessat(dfd, filename, mode);
+          }
+          """),
+          ])
+
+          # ---------------- fs/read_write.c ----------------
+          patch("fs/read_write.c", [
+          (
+          """SYSCALL_DEFINE3(read, unsigned int, fd, char __user *, buf, size_t, count)
+          {
+          	return ksys_read(fd, buf, count);
+          }
+          """,
+          """#ifdef CONFIG_KSU
+          extern bool ksu_vfs_read_hook __read_mostly;
+          extern void ksu_handle_sys_read(unsigned int fd);
+          #endif
+
+          SYSCALL_DEFINE3(read, unsigned int, fd, char __user *, buf, size_t, count)
+          {
+          #ifdef CONFIG_KSU
+          	if (unlikely(ksu_vfs_read_hook))
+          		ksu_handle_sys_read(fd);
+          #endif
+          	return ksys_read(fd, buf, count);
+          }
+          """),
+          ])
+
+          # ---------------- fs/stat.c ----------------
+          patch("fs/stat.c", [
+          (
+          """#if !defined(__ARCH_WANT_STAT64) || defined(__ARCH_WANT_SYS_NEWFSTATAT)
+          SYSCALL_DEFINE4(newfstatat, int, dfd, const char __user *, filename,
+          		struct stat __user *, statbuf, int, flag)
+          {
+          	struct kstat stat;
+          	int error;
+
+          	error = vfs_fstatat(dfd, filename, &stat, flag);
+          	if (error)
+          		return error;
+          	return cp_new_stat(&stat, statbuf);
+          }
+          #endif
+
+          SYSCALL_DEFINE2(newfstat, unsigned int, fd, struct stat __user *, statbuf)
+          {
+          	struct kstat stat;
+          	int error = vfs_fstat(fd, &stat);
+
+          	if (!error)
+          		error = cp_new_stat(&stat, statbuf);
+
+          	return error;
+          }
+          """,
+          """#ifdef CONFIG_KSU
+          extern int ksu_handle_stat(int *dfd, const char __user **filename_user, int *flags);
+          extern void ksu_handle_newfstat_ret(unsigned int *fd, struct stat __user **statbuf_ptr);
+          #endif
+
+          #if !defined(__ARCH_WANT_STAT64) || defined(__ARCH_WANT_SYS_NEWFSTATAT)
+          SYSCALL_DEFINE4(newfstatat, int, dfd, const char __user *, filename,
+          		struct stat __user *, statbuf, int, flag)
+          {
+          	struct kstat stat;
+          	int error;
+
+          #ifdef CONFIG_KSU
+          	ksu_handle_stat(&dfd, &filename, &flag);
+          #endif
+          	error = vfs_fstatat(dfd, filename, &stat, flag);
+          	if (error)
+          		return error;
+          	return cp_new_stat(&stat, statbuf);
+          }
+          #endif
+
+          SYSCALL_DEFINE2(newfstat, unsigned int, fd, struct stat __user *, statbuf)
+          {
+          	struct kstat stat;
+          	int error = vfs_fstat(fd, &stat);
+
+          	if (!error)
+          		error = cp_new_stat(&stat, statbuf);
+
+          #ifdef CONFIG_KSU
+          	ksu_handle_newfstat_ret(&fd, &statbuf);
+          #endif
+          	return error;
+          }
+          """),
+          ])
+
+          # ---------------- kernel/reboot.c ----------------
+          patch("kernel/reboot.c", [
+          (
+          """SYSCALL_DEFINE4(reboot, int, magic1, int, magic2, unsigned int, cmd,
+          		void __user *, arg)
+          {
+          	struct pid_namespace *pid_ns = task_active_pid_ns(current);
+          	char buffer[256];
+          	int ret = 0;
+
+          	/* We only trust the superuser with rebooting the system. */
+          """,
+          """#ifdef CONFIG_KSU
+          extern int ksu_handle_sys_reboot(int magic1, int magic2, unsigned int cmd,
+          				 void __user **arg);
+          #endif
+
+          SYSCALL_DEFINE4(reboot, int, magic1, int, magic2, unsigned int, cmd,
+          		void __user *, arg)
+          {
+          	struct pid_namespace *pid_ns = task_active_pid_ns(current);
+          	char buffer[256];
+          	int ret = 0;
+
+          #ifdef CONFIG_KSU
+          	ksu_handle_sys_reboot(magic1, magic2, cmd, &arg);
+          #endif
+          	/* We only trust the superuser with rebooting the system. */
+          """),
+          ])
+          print("all hooks applied")
+          HOOKS_EOF
+          python3 "$RUNNER_TEMP/ksu_manual_hooks.py" .
+
+          grep -q ksu_handle_sys_reboot kernel/reboot.c
+          echo "KernelSU-Next integrated with manual hooks."
 
       - name: Configure kernel
         shell: bash
@@ -163,23 +376,20 @@ jobs:
 
           if ! grep -RqsE \
             '^[[:space:]]*config KSU([[:space:]]|$)' \
-            drivers KernelSU 2>/dev/null; then
-            echo "::error::Could not find the KernelSU Kconfig entry."
+            drivers/kernelsu/ 2>/dev/null; then
+            echo "::error::Could not find the KernelSU-Next Kconfig entry."
             exit 1
           fi
 
           scripts/config --file out/.config -e KSU
+          scripts/config --file out/.config -e KSU_MANUAL_HOOK
+          scripts/config --file out/.config -d KSU_KPROBES_HOOK
           scripts/config --file out/.config -d LOCALVERSION_AUTO
-
-          # KPROBES hook mode instead of manual hooks
-          scripts/config --file out/.config -d KSU_MANUAL_HOOK
-          scripts/config --file out/.config -e KPROBES
-          scripts/config --file out/.config -e KPROBE_EVENTS
 
           make O=out ARCH=arm64 LLVM=1 olddefconfig
 
           grep -E \
-            '^(CONFIG_KSU|CONFIG_KPROBES|CONFIG_KPROBE_EVENTS|CONFIG_LOCALVERSION=|CONFIG_CFI_CLANG=|CONFIG_LTO_CLANG=)' \
+            '^(CONFIG_KSU|CONFIG_LOCALVERSION=|CONFIG_CFI_CLANG=|CONFIG_LTO_CLANG=)' \
             out/.config || true
 
           if ! grep -q '^CONFIG_KSU=y$' out/.config; then
@@ -187,13 +397,13 @@ jobs:
             exit 1
           fi
 
-          if grep -q '^CONFIG_KSU_MANUAL_HOOK=y$' out/.config; then
-            echo "::error::KSU_MANUAL_HOOK is still enabled."
+          if ! grep -q '^CONFIG_KSU_MANUAL_HOOK=y$' out/.config; then
+            echo "::error::CONFIG_KSU_MANUAL_HOOK=y was not enabled."
             exit 1
           fi
 
-          if ! grep -q '^CONFIG_KPROBES=y$' out/.config; then
-            echo "::error::CONFIG_KPROBES=y was not enabled."
+          if grep -q '^CONFIG_KSU_KPROBES_HOOK=y$' out/.config; then
+            echo "::error::KSU_KPROBES_HOOK must be off on 5.4."
             exit 1
           fi
 
