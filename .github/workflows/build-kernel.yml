@@ -12,6 +12,15 @@ on:
         required: true
         type: boolean
         default: true
+      cfi_permissive:
+        description: "CFI violations only warn instead of panicking (bootloop test build)"
+        required: true
+        type: boolean
+        default: true
+      boot_id:
+        description: "Drive file ID of the ROM's original boot.img (used to make a ready boot.img)"
+        required: true
+        default: "1Q8q51K8Ytx_aKMQSR34dKxMxH_lUtbM2"
 
 permissions:
   contents: read
@@ -33,6 +42,9 @@ jobs:
       EXPECTED_RELEASE: 5.4.302-qgki-g7a71935c393b
       DEFCONFIG: vendor/lineage-a52sxq_defconfig
       KSU_REF: ${{ inputs.ksu_ref }}
+      CFI_PERMISSIVE: ${{ inputs.cfi_permissive }}
+      ZIP_NAME: AnyKernel3-a52sxq-KernelSU${{ inputs.cfi_permissive && '-cfiperm' || '' }}.zip
+      FLASH_ZIP: a52sxq-bootimg${{ inputs.cfi_permissive && '-cfiperm' || '' }}-flashable.zip
 
     steps:
       - name: Checkout workflow repository
@@ -397,10 +409,14 @@ jobs:
           scripts/config --file out/.config -d KSU_KPROBES_HOOK
           scripts/config --file out/.config -d LOCALVERSION_AUTO
 
+          if [ "$CFI_PERMISSIVE" = "true" ]; then
+            scripts/config --file out/.config -e CFI_PERMISSIVE
+          fi
+
           make O=out ARCH=arm64 LLVM=1 olddefconfig
 
           grep -E \
-            '^(CONFIG_KSU|CONFIG_LOCALVERSION=|CONFIG_CFI_CLANG=|CONFIG_LTO_CLANG=)' \
+            '^(CONFIG_KSU|CONFIG_LOCALVERSION=|CONFIG_CFI_CLANG=|CONFIG_CFI_PERMISSIVE=|CONFIG_LTO_CLANG=)' \
             out/.config || true
 
           if ! grep -q '^CONFIG_KSU=y$' out/.config; then
@@ -410,6 +426,12 @@ jobs:
 
           if ! grep -q '^CONFIG_KSU_MANUAL_HOOK=y$' out/.config; then
             echo "::error::CONFIG_KSU_MANUAL_HOOK=y was not enabled."
+            exit 1
+          fi
+
+          if [ "$CFI_PERMISSIVE" = "true" ] &&
+             ! grep -q '^CONFIG_CFI_PERMISSIVE=y$' out/.config; then
+            echo "::error::CONFIG_CFI_PERMISSIVE=y was not enabled."
             exit 1
           fi
 
@@ -490,17 +512,67 @@ jobs:
           test -s Image
           test -s tools/ak3-core.sh
 
-          zip -r9 "$GITHUB_WORKSPACE/AnyKernel3-a52sxq-KernelSU.zip" .
-          unzip -t "$GITHUB_WORKSPACE/AnyKernel3-a52sxq-KernelSU.zip"
-          sha256sum "$GITHUB_WORKSPACE/AnyKernel3-a52sxq-KernelSU.zip"
+          zip -r9 "$GITHUB_WORKSPACE/$ZIP_NAME" .
+          unzip -t "$GITHUB_WORKSPACE/$ZIP_NAME"
+          sha256sum "$GITHUB_WORKSPACE/$ZIP_NAME"
 
-      - name: Upload kernel and ZIP
-        uses: actions/upload-artifact@v4
-        with:
-          name: a52sxq-infinityx-kernel-${{ github.run_number }}
-          if-no-files-found: error
-          retention-days: 14
-          path: |
-            kernel/out/arch/arm64/boot/Image
-            kernel/out/.config
-            AnyKernel3-a52sxq-KernelSU.zip
+      - name: Make ready boot.img (for TWRP Install Image or Odin)
+        continue-on-error: true
+        shell: bash
+        env:
+          BOOT_ID: ${{ inputs.boot_id }}
+        run: |
+          set -euo pipefail
+          python3 -m pip install --break-system-packages gdown
+
+          W="$RUNNER_TEMP/bootmk"
+          mkdir -p "$W" "$GITHUB_WORKSPACE/boot_ready"
+          cd "$W"
+
+          curl -fL --retry 3 -o magisk.apk \
+            https://github.com/topjohnwu/Magisk/releases/download/v30.7/Magisk-v30.7.apk
+          unzip -o -q magisk.apk 'lib/x86_64/libmagiskboot.so' -d x
+          cp x/lib/x86_64/libmagiskboot.so magiskboot
+          chmod +x magiskboot
+
+          gdown "https://drive.google.com/uc?id=$BOOT_ID" -O rom_boot.img
+          [ "$(head -c 8 rom_boot.img)" = "ANDROID!" ] || { echo "::error::rom_boot.img is not a boot image"; exit 1; }
+
+          ./magiskboot unpack rom_boot.img >/dev/null 2>&1 || true
+          test -s kernel
+          echo "ROM kernel: $(strings -n 8 kernel | grep -m1 'Linux version' | cut -c1-90 || true)"
+
+          cp "$GITHUB_WORKSPACE/kernel/out/arch/arm64/boot/Image" kernel
+          ./magiskboot repack rom_boot.img boot_new.img >/dev/null 2>&1 || true
+          test -s boot_new.img
+
+          size="$(stat -c %s boot_new.img)"
+          [ "$size" -le 100663296 ] || { echo "::error::boot_new.img is bigger than the boot partition"; exit 1; }
+
+          mkdir v && cp boot_new.img v/ && ( cd v && ../magiskboot unpack boot_new.img >/dev/null 2>&1 || true )
+          cmp v/kernel "$GITHUB_WORKSPACE/kernel/out/arch/arm64/boot/Image"
+          echo "OK: boot_new.img contains the new kernel"
+
+          cp boot_new.img "$GITHUB_WORKSPACE/boot_ready/boot_new.img"
+          cp boot_new.img boot.img
+          tar -H ustar -cf "$GITHUB_WORKSPACE/boot_ready/AP_boot_a52sxq.tar" boot.img
+
+          sha="$(sha256sum boot_new.img | cut -d' ' -f1)"
+          echo "$sha  boot_new.img  $size bytes" | tee "$GITHUB_WORKSPACE/boot_ready/boot_new.img.sha256.txt"
+
+      - name: Make simple flashable ZIP (dd + verify, no repack in recovery)
+        if: hashFiles('boot_ready/boot_new.img') != ''
+        continue-on-error: true
+        shell: bash
+        run: |
+          set -euo pipefail
+          Z="$RUNNER_TEMP/flashzip"
+          mkdir -p "$Z/META-INF/com/google/android" "$Z/images"
+
+          cp boot_ready/boot_new.img "$Z/images/boot.img"
+          ( cd "$Z/images" && sha256sum boot.img > boot.img.sha256 )
+          echo "# dummy: update-binary is a shell script" > "$Z/META-INF/com/google/android/updater-script"
+
+          cat > "$Z/META-INF/com/google/android/update-binary" <<'UB_EOF'
+          #!/sbin/sh
+        
