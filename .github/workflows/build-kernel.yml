@@ -575,7 +575,7 @@ jobs:
 
           cat > "$Z/META-INF/com/google/android/update-binary" <<'UB_EOF'
           #!/sbin/sh
-              - name: Upload kernel and ZIP
+      - name: Upload kernel and ZIP
         uses: actions/upload-artifact@v4
         with:
           name: a52sxq-infinityx-kernel-${{ github.run_number }}
