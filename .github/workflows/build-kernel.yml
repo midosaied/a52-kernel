@@ -351,6 +351,17 @@ jobs:
           HOOKS_EOF
           python3 "$RUNNER_TEMP/ksu_manual_hooks.py" .
 
+          # KernelSU-Next patches fs/namespace.c and friends from its Kbuild, but only
+          # while drivers/ is being built, which is too late (fs/ is already compiled).
+          # Run that same backport section now, before the build starts.
+          {
+            printf 'all:\n\t@true\n\n'
+            sed -n '/^# some backports/,$p' KernelSU-Next/kernel/Kbuild
+          } > "$RUNNER_TEMP/ksu_backports.mk"
+          make -s -f "$RUNNER_TEMP/ksu_backports.mk" srctree=.
+          grep -q '^int path_umount' fs/namespace.c
+          grep -q 'path_umount' fs/internal.h
+
           grep -q ksu_handle_sys_reboot kernel/reboot.c
           echo "KernelSU-Next integrated with manual hooks."
 
