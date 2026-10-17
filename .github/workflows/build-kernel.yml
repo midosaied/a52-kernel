@@ -575,4 +575,17 @@ jobs:
 
           cat > "$Z/META-INF/com/google/android/update-binary" <<'UB_EOF'
           #!/sbin/sh
-        
+              - name: Upload kernel and ZIP
+        uses: actions/upload-artifact@v4
+        with:
+          name: a52sxq-infinityx-kernel-${{ github.run_number }}
+          if-no-files-found: error
+          retention-days: 14
+          path: |
+            kernel/out/arch/arm64/boot/Image
+            kernel/out/.config
+            ${{ env.ZIP_NAME }}
+            boot_ready/boot_new.img
+            boot_ready/${{ env.FLASH_ZIP }}
+            boot_ready/AP_boot_a52sxq.tar
+            boot_ready/boot_new.img.sha256.txt
